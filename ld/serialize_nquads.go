@@ -20,7 +20,6 @@ import (
 	"fmt"
 	"io"
 	"regexp"
-	"sort"
 	"strings"
 )
 
@@ -35,19 +34,15 @@ func (s *NQuadRDFSerializer) Parse(input interface{}) (*RDFDataset, error) {
 
 // SerializeTo writes RDFDataset as N-Quad into a writer.
 func (s *NQuadRDFSerializer) SerializeTo(w io.Writer, dataset *RDFDataset) error {
-	quads := make([]string, 0)
 	for graphName, triples := range dataset.Graphs {
 		if graphName == "@default" {
 			graphName = ""
 		}
 		for _, triple := range triples {
-			quads = append(quads, toNQuad(triple, graphName))
-		}
-	}
-	sort.Strings(quads)
-	for _, quad := range quads {
-		if _, err := fmt.Fprint(w, quad); err != nil {
-			return NewJsonLdError(IOError, err)
+			quad := toNQuad(triple, graphName)
+			if _, err := fmt.Fprint(w, quad); err != nil {
+				return NewJsonLdError(IOError, err)
+			}
 		}
 	}
 	return nil
@@ -271,7 +266,7 @@ func ParseNQuadsFrom(o interface{}) (*RDFDataset, error) {
 
 		// parse quad
 		if !regexQuad.Match(line) {
-			return nil, NewJsonLdError(SyntaxError, fmt.Errorf("Error while parsing N-Quads; invalid quad. line: %d", lineNumber))
+			return nil, NewJsonLdError(SyntaxError, fmt.Errorf("error while parsing N-Quads; invalid quad. line: %d", lineNumber))
 		}
 		match := regexQuad.FindStringSubmatch(string(line))
 

@@ -15,6 +15,7 @@
 package ld
 
 import (
+	"fmt"
 	"strings"
 )
 
@@ -86,7 +87,7 @@ func (api *JsonLdApi) Frame(input interface{}, frame []interface{}, opts *JsonLd
 
 	// produce a map of all graphs and name each bnode
 	issuer := NewIdentifierIssuer("_:b")
-	if _, err := api.GenerateNodeMap(input, state.graphMap, "@default", issuer, "", nil); err != nil {
+	if _, err := api.GenerateNodeMap(input, state.graphMap, "@default", issuer, "", "", nil); err != nil {
 		return nil, nil, err
 	}
 
@@ -96,18 +97,21 @@ func (api *JsonLdApi) Frame(input interface{}, frame []interface{}, opts *JsonLd
 	}
 	state.subjects = state.graphMap[state.graph].(map[string]interface{})
 
-	framed := make([]interface{}, 0)
+	// validate the frame
+	if err := validateFrame(frame); err != nil {
+		return nil, nil, err
+	}
 
-	// NOTE: frame validation is done by the function not allowing anything
-	// other than list to me passed
 	// 1.
-	// If frame is an array, set frame to the first member of the array, which MUST be a valid frame.
+	// If frame is an array, set frame to the first member of the array.
 	var frameParam map[string]interface{}
-	if frame != nil && len(frame) > 0 {
+	if len(frame) > 0 {
 		frameParam = frame[0].(map[string]interface{})
 	} else {
 		frameParam = make(map[string]interface{})
 	}
+
+	framed := make([]interface{}, 0)
 	framedVal, err := api.matchFrame(state, GetOrderedKeys(state.subjects), frameParam, framed, "")
 	if err != nil {
 		return nil, nil, err
@@ -156,7 +160,7 @@ func (api *JsonLdApi) mergeNodeMapGraphs(graphs map[string]interface{}) map[stri
 				} else {
 					// merge objects
 					for _, v := range node[property].([]interface{}) {
-						AddValue(mergedNode, property, CloneDocument(v), true, false)
+						AddValue(mergedNode, property, CloneDocument(v), true, false, false, false)
 					}
 				}
 			}
@@ -223,7 +227,7 @@ func (api *JsonLdApi) matchFrame(state *FramingContext, subjects []string,
 
 		// keep track of objects having blank nodes
 		if strings.HasPrefix(id, "_:") {
-			AddValue(state.bnodeMap, id, output, true, true)
+			AddValue(state.bnodeMap, id, output, true, false, true, false)
 		}
 
 		// 5.3
@@ -294,7 +298,7 @@ func (api *JsonLdApi) matchFrame(state *FramingContext, subjects []string,
 					// count bnode values of @type
 					for _, t := range subject[prop].([]interface{}) {
 						if strings.HasPrefix(t.(string), "_:") {
-							AddValue(state.bnodeMap, t.(string), output, true, true)
+							AddValue(state.bnodeMap, t.(string), output, true, false, true, false)
 						}
 					}
 				}
@@ -325,9 +329,9 @@ func (api *JsonLdApi) matchFrame(state *FramingContext, subjects []string,
 							// recurse into subject reference
 							itemid := listitem.(map[string]interface{})["@id"].(string)
 
-							subframe := make(map[string]interface{})
-							if containsProp {
-								subframe = framePropVal.([]interface{})[0].(map[string]interface{})["@list"].(map[string]interface{})
+							var subframe map[string]interface{}
+							if containsProp && IsList(framePropVal.([]interface{})[0]) {
+								subframe = framePropVal.([]interface{})[0].(map[string]interface{})["@list"].([]interface{})[0].(map[string]interface{})
 							} else {
 								subframe = flags
 							}
@@ -343,7 +347,7 @@ func (api *JsonLdApi) matchFrame(state *FramingContext, subjects []string,
 						}
 					}
 				} else {
-					subframe := make(map[string]interface{})
+					var subframe map[string]interface{}
 					if containsProp {
 						subframe = framePropVal.([]interface{})[0].(map[string]interface{})
 					} else {
@@ -410,7 +414,8 @@ func (api *JsonLdApi) matchFrame(state *FramingContext, subjects []string,
 								outputReverse = make(map[string]interface{})
 								output["@reverse"] = outputReverse
 							}
-							AddValue(output["@reverse"], reverseProp, []interface{}{}, true, true)
+							AddValue(output["@reverse"], reverseProp, []interface{}{}, true,
+								false, true, false)
 							var subframe map[string]interface{}
 							sf := reverse.(map[string]interface{})[reverseProp]
 							if sfArray, isArray := sf.([]interface{}); isArray {
@@ -438,6 +443,60 @@ func (api *JsonLdApi) matchFrame(state *FramingContext, subjects []string,
 	}
 
 	return parent, nil
+}
+
+// validateFrame validates a JSON-LD frame, returning an error if the frame is invalid.
+func validateFrame(frame interface{}) error {
+
+	valid := true
+	if frameList, isList := frame.([]interface{}); isList {
+		if len(frameList) > 1 {
+			valid = false
+		} else if len(frameList) == 1 {
+			frame = frameList[0]
+			if _, isMap := frame.(map[string]interface{}); !isMap {
+				valid = false
+			}
+		} else {
+			// TODO: other JSON-LD implementations don't cater for this case (frame==[]). Investigate.
+			return nil
+		}
+
+	} else if _, isMap := frame.(map[string]interface{}); !isMap {
+		valid = false
+	}
+
+	if !valid {
+		return NewJsonLdError(InvalidFrame, "Invalid JSON-LD syntax; a JSON-LD frame must be a single object")
+	}
+
+	frameMap := frame.(map[string]interface{})
+
+	if id, hasID := frameMap["@id"]; hasID {
+		for _, idVal := range Arrayify(id) {
+			if _, isMap := idVal.(map[string]interface{}); isMap {
+				continue
+			}
+			if strings.HasPrefix(idVal.(string), "_:") {
+				return NewJsonLdError(InvalidFrame,
+					fmt.Sprintf("Invalid JSON-LD frame syntax; invalid value of @id: %v", id))
+			}
+		}
+	}
+
+	if t, hasType := frameMap["@type"]; hasType {
+		for _, typeVal := range Arrayify(t) {
+			if _, isMap := typeVal.(map[string]interface{}); isMap {
+				continue
+			}
+			if strings.HasPrefix(typeVal.(string), "_:") {
+				return NewJsonLdError(InvalidFrame,
+					fmt.Sprintf("Invalid JSON-LD frame syntax; invalid value of @type: %v", t))
+			}
+		}
+	}
+
+	return nil
 }
 
 func getFrameValue(frame map[string]interface{}, name string) interface{} {
@@ -507,10 +566,11 @@ func getFrameEmbed(frame map[string]interface{}, theDefault Embed) (Embed, error
 		case "@last":
 			return EmbedLast, nil
 		default:
-			return EmbedLast, NewJsonLdError(SyntaxError, "invalid @embed value")
+			return EmbedLast, NewJsonLdError(InvalidEmbedValue,
+				fmt.Sprintf("Invalid JSON-LD frame syntax; invalid value of @embed: %s", stringVal))
 		}
 	}
-	return EmbedLast, NewJsonLdError(SyntaxError, "invalid @embed value")
+	return EmbedLast, NewJsonLdError(InvalidEmbedValue, "Invalid JSON-LD frame syntax; invalid value of @embed")
 }
 
 // removeEmbed removes an existing embed with the given id.
@@ -546,7 +606,7 @@ func removeEmbed(state *FramingContext, id string) {
 		parentMap := parent.(map[string]interface{})
 		_, useArray := parentMap[property]
 		RemoveValue(parentMap, property, subject, useArray)
-		AddValue(parentMap, property, subject, useArray, true)
+		AddValue(parentMap, property, subject, useArray, false, true, false)
 	}
 	// recursively remove dependent dangling embeds
 	removeDependents(links, id)
@@ -684,6 +744,9 @@ func FilterSubject(state *FramingContext, subject map[string]interface{}, frame 
 		}
 		hasDefault := false
 		if thisFrame != nil {
+			if err := validateFrame(thisFrame); err != nil {
+				return false, err
+			}
 			_, hasDefault = thisFrame.(map[string]interface{})["@default"]
 		}
 
@@ -762,7 +825,7 @@ func FilterSubject(state *FramingContext, subject map[string]interface{}, frame 
 // output: the output to add.
 func addFrameOutput(parent interface{}, property string, output interface{}) interface{} {
 	if parentMap, isMap := parent.(map[string]interface{}); isMap {
-		AddValue(parentMap, property, output, true, true)
+		AddValue(parentMap, property, output, true, false, true, false)
 		return parentMap
 	}
 
@@ -793,9 +856,9 @@ func nodeMatch(state *FramingContext, pattern, value map[string]interface{}, req
 //     and `pattern[@language]` is `{}`, or `value[@language]` is None
 //     and `pattern[@language]` is None or `[]`
 func valueMatch(pattern, value map[string]interface{}) bool {
-	v2v, _ := pattern["@value"]
-	t2v, _ := pattern["@type"]
-	l2v, _ := pattern["@language"]
+	v2v := pattern["@value"]
+	t2v := pattern["@type"]
+	l2v := pattern["@language"]
 
 	if v2v == nil && t2v == nil && l2v == nil {
 		return true
@@ -814,9 +877,9 @@ func valueMatch(pattern, value map[string]interface{}) bool {
 		l2 = Arrayify(l2v)
 	}
 
-	v1, _ := value["@value"]
-	t1, _ := value["@type"]
-	l1, _ := value["@language"]
+	v1 := value["@value"]
+	t1 := value["@type"]
+	l1 := value["@language"]
 
 	if !(inArray(v1, v2) || (len(v2) > 0 && isEmptyObject(v2[0]))) {
 		return false
